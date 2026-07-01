@@ -19,9 +19,9 @@ nacional), dedup, verificar_citacao, dataclasses.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
-import os
 import re
 import unicodedata
 from collections import OrderedDict
@@ -32,7 +32,6 @@ import httpx
 
 BASE_URL = "https://apijuris.tjma.jus.br/v1"
 PORTAL_URL = "https://jurisconsult.tjma.jus.br"
-DEBUG = os.environ.get("TJMA_DEBUG") == "1"
 
 # O cert HTTPS da apijuris costuma estar inválido/expirado -> verify=False.
 # UA de browser reduz atrito com o WAF (que bloqueia mesmo é por volume).
@@ -272,6 +271,18 @@ def _item_para_resultado(it: dict) -> Resultado:
     )
 
 
+def _processos_de(data: dict) -> list:
+    """Extrai a lista de processos do JSON de forma tolerante: `response` pode
+    vir como {"processos": [...]}, como lista direta, ou ausente (0 resultados).
+    """
+    resp = data.get("response")
+    if isinstance(resp, dict):
+        return resp.get("processos") or []
+    if isinstance(resp, list):
+        return resp
+    return []
+
+
 def _item_para_decisao(it: dict) -> Decisao:
     cnj = _clean(it.get("pkProtocolo"))
     texto = _clean_multiline(it.get("txacordao") or it.get("txEmenta"))
@@ -292,7 +303,15 @@ def _item_para_decisao(it: dict) -> Decisao:
 
 
 class ConsultaRecusada(RuntimeError):
-    """A API recusou a consulta (rate-limit, captcha ou validacao)."""
+    """A API recusou a consulta (rate-limit, captcha ou validacao).
+
+    `retryable=True` para falhas transitórias (rate-limit 403, erro 5xx) que
+    valem nova tentativa com backoff; False para recusa definitiva.
+    """
+
+    def __init__(self, mensagem: str, retryable: bool = False):
+        super().__init__(mensagem)
+        self.retryable = retryable
 
 
 # --------------------------------------------------------------------------- #
@@ -301,6 +320,8 @@ class ConsultaRecusada(RuntimeError):
 class TJMAClient:
     _CACHE_MAX = 32
     _MAX_LINHAS = 50  # teto de linhas por consulta (inicioPagina..fimPagina)
+    _MAX_TENTATIVAS = 3       # tentativas em falha transitória (rate-limit)
+    _BACKOFF_BASE = 3.0       # segundos entre tentativas (3s, 6s, ...)
 
     def __init__(self, timeout: float = 40.0):
         self._client = httpx.AsyncClient(
@@ -323,16 +344,22 @@ class TJMAClient:
     async def _novo_bearer(self) -> str:
         """Gera captcha, decodifica a resposta e monta o header Bearer."""
         r = await self._get(EP_CAPTCHA)
-        cap = r.json()["response"]["captcha"]
-        token = cap["tokenCaptcha"]
-        valor = _resolver_captcha_do_token(token)
-        return f"{token} {valor}"
+        if r.status_code != 200:
+            raise ConsultaRecusada(
+                f"Falha ao gerar captcha (HTTP {r.status_code}) — provável "
+                "rate-limit por IP; aguarde alguns minutos.",
+                retryable=(r.status_code == 403 or r.status_code >= 500),
+            )
+        try:
+            token = r.json()["response"]["captcha"]["tokenCaptcha"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise ConsultaRecusada(f"Resposta inesperada do gera_captcha: {e}")
+        return f"{token} {_resolver_captcha_do_token(token)}"
 
     async def listar_filtros(self, tipo: str) -> list[dict]:
-        """Lista as opções válidas de um filtro (classes, camaras, relatores,
-        tipos_pesquisa). Retorna [{id, label}]. Use para achar o id a passar
-        em buscar_jurisprudencia (relator/revisor=matrícula, camara=pkcamara,
-        classe=id_classe).
+        """Lista as opções válidas de um filtro ("classes" ou "tipos_pesquisa").
+        Retorna [{id, label}]. Use para achar o id a passar em
+        buscar_jurisprudencia (classe=id_classe; tipo_pesquisa=opção).
         """
         if tipo not in _LISTAS_FILTRO:
             raise ValueError(
@@ -346,8 +373,25 @@ class TJMAClient:
 
     async def _consultar(self, chave: str, inicio: int, fim: int,
                          filtros: Optional[dict] = None) -> dict:
-        """Executa a consulta bruta e devolve o JSON. Levanta ConsultaRecusada
-        em erro de negocio/captcha/rate-limit.
+        """Consulta com retry/backoff para o rate-limit (403) transitório.
+        Erros definitivos (validação/negócio) sobem na primeira tentativa.
+        """
+        ultimo: Optional[ConsultaRecusada] = None
+        for tentativa in range(self._MAX_TENTATIVAS):
+            try:
+                return await self._consultar_once(chave, inicio, fim, filtros)
+            except ConsultaRecusada as e:
+                if not e.retryable:
+                    raise
+                ultimo = e
+                if tentativa < self._MAX_TENTATIVAS - 1:
+                    await asyncio.sleep(self._BACKOFF_BASE * (tentativa + 1))
+        raise ultimo  # type: ignore[misc]
+
+    async def _consultar_once(self, chave: str, inicio: int, fim: int,
+                              filtros: Optional[dict] = None) -> dict:
+        """Uma tentativa de consulta. Levanta ConsultaRecusada em
+        rate-limit/erro de servidor (retryable) ou recusa de negócio.
         """
         f = filtros or {}
         bearer = await self._novo_bearer()
@@ -370,20 +414,30 @@ class TJMAClient:
             "tokenG": _TOKENG_DUMMY,
             "keyId": _KEYID_BYPASS,   # bogus -> backend pula validacao do reCAPTCHA
         }
-        headers = {"Authorization": f"Bearer {bearer}",
-                   "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {bearer}"}
         r = await self._get(EP_BUSCA_ACORDAOS, params=params, headers=headers)
         if r.status_code == 403:
             data = None
             try:
                 data = r.json()
-            except Exception:
+            except ValueError:
                 pass
             raise ConsultaRecusada(
-                f"HTTP 403 do TJMA (rate-limit por IP ou validacao). "
-                f"{json.dumps(data, ensure_ascii=False) if data else ''}".strip()
+                "HTTP 403 do TJMA (rate-limit por IP ou validação). "
+                f"{json.dumps(data, ensure_ascii=False) if data else ''}".strip(),
+                retryable=True,
             )
-        data = r.json()
+        if r.status_code >= 500:
+            raise ConsultaRecusada(
+                f"Erro no servidor do TJMA (HTTP {r.status_code}).",
+                retryable=True,
+            )
+        try:
+            data = r.json()
+        except ValueError:
+            raise ConsultaRecusada(
+                f"Resposta não-JSON do TJMA (HTTP {r.status_code})."
+            )
         resp = data.get("response", data)
         if isinstance(resp, dict) and ("message" in resp or "validacao" in resp):
             raise ConsultaRecusada(
@@ -403,7 +457,7 @@ class TJMAClient:
         fim = inicio + limite - 1
 
         data = await self._consultar(query.strip(), inicio, fim, filtros)
-        procs = data["response"].get("processos", [])
+        procs = _processos_de(data)
 
         busca = Busca(paginas_consultadas=1)
         if procs:
@@ -436,14 +490,16 @@ class TJMAClient:
         if cnj in self._cache_decisoes:
             self._cache_decisoes.move_to_end(cnj)
             return self._cache_decisoes[cnj]
-        # busca pelo proprio CNJ como chave
-        data = await self._consultar(cnj, 1, 5)
-        procs = data["response"].get("processos", [])
+        # Busca EXATA pelo número do processo (tipoPesquisa=6). NUNCA cai em
+        # outro processo: se o CNJ exato não aparecer, é "não encontrado".
+        data = await self._consultar(cnj, 1, 5, {"tipo_pesquisa": "6"})
+        procs = _processos_de(data)
         alvo = next((p for p in procs if _clean(p.get("pkProtocolo")) == cnj), None)
-        if alvo is None and procs:
-            alvo = procs[0]
         if alvo is None:
-            raise ConsultaRecusada(f"Decisao {cnj} nao encontrada.")
+            raise ConsultaRecusada(
+                f"Decisão {cnj} não encontrada na base de acórdãos do TJ-MA "
+                "(confira o número CNJ)."
+            )
         decisao = _item_para_decisao(alvo)
         self._cache_decisoes[cnj] = decisao
         if len(self._cache_decisoes) > self._CACHE_MAX:
